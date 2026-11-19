@@ -54,6 +54,15 @@ struct OrderDelete {  // 'D'
   Header h;
   std::uint64_t ref;
 };
+struct SystemEvent {  // 'S'
+  Header h;
+  char code;  // O start, S system open 04:00, Q market open 09:30, M market close 16:00, E system close, C end
+};
+struct TradingAction {  // 'H'
+  Header h;
+  char stock[8];
+  char state;  // T trading, H halted, P paused, Q quotation only
+};
 struct OrderReplace {  // 'U'
   Header h;
   std::uint64_t orig_ref;
@@ -73,6 +82,8 @@ constexpr std::size_t size_of(char type) {
     case 'X': return 23;
     case 'D': return 19;
     case 'U': return 35;
+    case 'S': return 12;
+    case 'H': return 25;
     default: return 0;
   }
 }
@@ -84,6 +95,8 @@ struct NullHandler {
   void on(const OrderCancel&) {}
   void on(const OrderDelete&) {}
   void on(const OrderReplace&) {}
+  void on(const SystemEvent&) {}
+  void on(const TradingAction&) {}
 };
 
 // Returns false for a message shorter than its type requires. Unused types are skipped.
@@ -119,6 +132,13 @@ bool dispatch(const std::uint8_t* p, std::size_t len, H& h) {
     case 'X': h.on(OrderCancel{hd, be(b, 8), be32(b + 8)}); break;
     case 'D': h.on(OrderDelete{hd, be(b, 8)}); break;
     case 'U': h.on(OrderReplace{hd, be(b, 8), be(b + 8, 8), be32(b + 16), be32(b + 20)}); break;
+    case 'S': h.on(SystemEvent{hd, static_cast<char>(b[0])}); break;
+    case 'H': {
+      TradingAction m{hd, {}, static_cast<char>(b[8])};
+      std::memcpy(m.stock, b, 8);
+      h.on(m);
+      break;
+    }
   }
   return true;
 }
@@ -217,6 +237,17 @@ class Writer {
     auto s = start('D', locate, ts);
     put(ref, 8);
     finish(s, 'D');
+  }
+  void system_event(std::uint64_t ts, char code) {
+    auto s = start('S', 0, ts);
+    put(static_cast<std::uint8_t>(code), 1);
+    finish(s, 'S');
+  }
+  void trading_action(std::uint16_t locate, std::uint64_t ts, std::string_view stock, char state) {
+    auto s = start('H', locate, ts);
+    put_stock(stock);
+    put(static_cast<std::uint8_t>(state), 1);
+    finish(s, 'H');  // reserved byte and reason code are zero
   }
   void replace(std::uint16_t locate, std::uint64_t ts, std::uint64_t orig, std::uint64_t new_ref,
                std::uint32_t shares, std::uint32_t price) {

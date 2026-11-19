@@ -93,7 +93,17 @@ The input is `01302019.NASDAQ_ITCH50.gz`, streamed through `gunzip -c`.
 How to read this:
 
 - **The decoder holds up.** It handled all 368M messages with nothing malformed and nothing rejected.
-- **The book mirrors Nasdaq's.** Only 97 adds out of 164.7M crossed our book, and only 137 messages referenced an order we no longer had. My unverified guess: these come from periods when Nasdaq accepts orders without matching them, such as halts and IPO quote-only windows, where the real book can cross until a cross auction clears it. Our engine matches them right away instead. That eats orders Nasdaq still considers live, which then show up later as unknown refs.
+- **The book mirrors Nasdaq's in normal trading.** Only 97 adds out of 164.7M crossed our book, and only 137 messages referenced an order we no longer had. Tracing them with `--trace` shows that **every crossing add came from a symbol that was not in normal trading**:
+
+  | Symbol state (from ITCH `H` messages) | Crossing adds | Symbols |
+  |---|---:|---|
+  | `P`: trading pause, during market hours | 95 | SXTC (90), PHUN (3), DLPN (2) |
+  | `Q`: quotation only, pre-market | 2 | EYEN |
+  | `T`: normal trading | **0** | |
+
+  While a symbol is paused, Nasdaq keeps accepting orders but doesn't match them, so its book can cross until the reopening cross clears it. This engine always matches straight away, so it fills orders that Nasdaq still has resting. Those are the orders that come back later as unknown refs. I haven't traced the 137 individually, though. 15 of the 97 sat exactly at the opposite price and 82 went through it.
+
+  **Fix, not built yet:** while a symbol isn't in state `T`, rest incoming orders without matching them, then run a cross when trading resumes. That means the "never crossed" invariant has to apply only to symbols in state `T`.
 - **The FIFO gap is real exchange behaviour.** About 0.09% of executions hit an order other than the oldest order at the best price. That's consistent with reserve-order refills and other priority rules that pure price-time ordering doesn't model.
 - **Real-day latency is higher than the synthetic one.** Mean 338 ns vs 204 ns, because a real day has more symbols and a bigger working set, and so more cache misses.
 - **gunzip isn't the bottleneck.** The untimed AAPL pass read the same file at 18.8M msg/s.
@@ -123,6 +133,8 @@ Nasdaq publishes full-day ITCH 5.0 sample files at <https://emi.nasdaq.com/ITCH/
 gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay -
 # one symbol, with its top of book at end of day
 gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay - --symbol AAPL
+# list every add that crossed our book, with its symbol state and time
+gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay - --no-timing --trace
 ```
 
 The replayer feeds `A`/`F` adds, `E`/`C` executions, `X` partial cancels, `D` deletes and `U` replaces into one `OrderBook` per instrument, then reports these checks:

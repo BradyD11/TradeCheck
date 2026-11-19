@@ -3,6 +3,7 @@
 //   gunzip -c 01302019.NASDAQ_ITCH50.gz | itch_replay -
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 
 #include "lob/replay.hpp"
@@ -32,14 +33,15 @@ static void print_top(const OrderBook& b, int depth) {
 int main(int argc, char** argv) {
   const char* path = nullptr;
   std::string symbol;
-  bool timing = true;
+  bool timing = true, trace = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--symbol") && i + 1 < argc) symbol = argv[++i];
     else if (!std::strcmp(argv[i], "--no-timing")) timing = false;
+    else if (!std::strcmp(argv[i], "--trace")) trace = true;
     else path = argv[i];
   }
   if (!path) {
-    std::fprintf(stderr, "usage: itch_replay <file|-> [--symbol AAPL] [--no-timing]\n");
+    std::fprintf(stderr, "usage: itch_replay <file|-> [--symbol AAPL] [--no-timing] [--trace]\n");
     return 2;
   }
   std::FILE* f = std::strcmp(path, "-") ? std::fopen(path, "rb") : stdin;
@@ -78,6 +80,29 @@ int main(int argc, char** argv) {
     std::printf("FIFO agrees   %.4f%%  (%llu of %llu Nasdaq executions hit the order our priority picks)\n",
                 100.0 * s.front_agree / s.front_checks, (unsigned long long)s.front_agree,
                 (unsigned long long)s.front_checks);
+  if (!replay.crosses.empty()) {
+    std::map<std::string, std::uint64_t> by_context;
+    std::uint64_t locked = 0;
+    for (const CrossEvent& c : replay.crosses) {
+      by_context[std::string("trading state ") + c.state + ", system event " + c.phase] += 1;
+      locked += c.touch == Price(c.price);
+    }
+    std::printf("  crossing adds by context (%llu at exactly the opposite price, %llu through it):\n",
+                (unsigned long long)locked, (unsigned long long)(replay.crosses.size() - locked));
+    for (const auto& [ctx, n] : by_context) std::printf("    %-36s %llu\n", ctx.c_str(), (unsigned long long)n);
+    if (trace) {
+      std::printf("    %-8s %-15s %s %s %s %s %12s %12s %8s\n", "symbol", "time", "k", "st", "ev", "side", "price",
+                  "touch", "traded");
+      for (const CrossEvent& c : replay.crosses) {
+        std::uint64_t t = c.timestamp / 1'000'000;  // ms
+        std::printf("    %-8s %02llu:%02llu:%02llu.%03llu %c %2c %2c %4c %12.4f %12.4f %8u\n",
+                    replay.name(c.locate).c_str(), (unsigned long long)(t / 3'600'000),
+                    (unsigned long long)(t / 60'000 % 60), (unsigned long long)(t / 1000 % 60),
+                    (unsigned long long)(t % 1000), c.kind, c.state, c.phase, c.side, c.price / 10000.0,
+                    c.touch / 10000.0, c.traded);
+      }
+    }
+  }
   std::printf("invariants    %s\n", replay.check_all_invariants() ? "OK" : "VIOLATED");
   if (timing) {
     std::printf("\nper-op latency (book op only, excludes parsing):\n");

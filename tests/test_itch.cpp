@@ -18,12 +18,16 @@ struct Recorder : NullHandler {
   std::vector<OrderDelete> deletes;
   std::vector<OrderReplace> replaces;
   std::string stock;
+  std::vector<SystemEvent> events;
+  std::vector<TradingAction> actions;
   void on(const StockDirectory& m) { types.push_back('R'); stock.assign(m.stock, 8); }
   void on(const AddOrder& m) { types.push_back(m.h.type); adds.push_back(m); }
   void on(const OrderExecuted& m) { types.push_back(m.h.type); execs.push_back(m); }
   void on(const OrderCancel& m) { types.push_back('X'); cancels.push_back(m); }
   void on(const OrderDelete& m) { types.push_back('D'); deletes.push_back(m); }
   void on(const OrderReplace& m) { types.push_back('U'); replaces.push_back(m); }
+  void on(const SystemEvent& m) { types.push_back('S'); events.push_back(m); }
+  void on(const TradingAction& m) { types.push_back('H'); actions.push_back(m); }
 };
 
 static void read_all(std::vector<std::uint8_t>& bytes, std::size_t chunk, Recorder& rec, bool& error) {
@@ -39,7 +43,9 @@ static void read_all(std::vector<std::uint8_t>& bytes, std::size_t chunk, Record
 
 static void round_trip_every_type() {
   Writer w;
+  w.system_event(0, 'Q');
   w.stock_directory(7, 1, "AAPL");
+  w.trading_action(7, 1, "AAPL", 'H');
   w.add(7, 2, 1001, 'B', 300, "AAPL", 1'500'250);
   w.add(7, 3, 1002, 'S', 200, "AAPL", 1'500'300, 0x4E534454);
   w.executed(7, 4, 1001, 100, 55);
@@ -47,15 +53,18 @@ static void round_trip_every_type() {
   w.cancel(7, 6, 1001, 25);
   w.replace(7, 7, 1002, 1003, 400, 1'500'400);
   w.del(7, 0xFFFFFFFFFFFF, 1003);  // max 48-bit timestamp
-  w.bytes.insert(w.bytes.end(), {0, 3, 'S', 0, 1});  // unknown type: skipped, not an error
+  w.bytes.insert(w.bytes.end(), {0, 3, 'z', 0, 1});  // unknown type: skipped, not an error
 
   for (std::size_t chunk : {std::size_t{1} << 20, std::size_t{7}, std::size_t{1}}) {  // small chunks split messages
     Recorder rec;
     bool error;
     read_all(w.bytes, chunk, rec, error);
     CHECK(!error);
-    CHECK((rec.types == std::vector<char>{'R', 'A', 'F', 'E', 'C', 'X', 'U', 'D'}));
+    CHECK((rec.types == std::vector<char>{'S', 'R', 'H', 'A', 'F', 'E', 'C', 'X', 'U', 'D'}));
     CHECK(rec.stock == "AAPL    ");
+    CHECK(rec.events[0].code == 'Q' && rec.events[0].h.locate == 0);
+    CHECK(rec.actions[0].state == 'H' && rec.actions[0].h.locate == 7);
+    CHECK(std::memcmp(rec.actions[0].stock, "AAPL    ", 8) == 0);
     CHECK(rec.adds[0].h.locate == 7 && rec.adds[0].h.timestamp == 2);
     CHECK(rec.adds[0].ref == 1001 && rec.adds[0].side == 'B' && rec.adds[0].shares == 300);
     CHECK(rec.adds[0].price == 1'500'250 && std::memcmp(rec.adds[0].stock, "AAPL    ", 8) == 0);
@@ -106,9 +115,33 @@ static void synthetic_day_replays_cleanly() {
   CHECK(replay.check_all_invariants());
 }
 
+// A halted symbol's book can cross on Nasdaq; the replayer must record that with its context.
+static void crossing_add_is_traced() {
+  Writer w;
+  w.system_event(0, 'Q');
+  w.stock_directory(3, 1, "HALT");
+  w.trading_action(3, 2, "HALT", 'H');
+  w.add(3, 3, 1, 'S', 100, "HALT", 100'000);
+  w.add(3, 4, 2, 'B', 40, "HALT", 101'000);  // crosses through the ask
+  Replayer replay;
+  std::FILE* f = fmemopen(w.bytes.data(), w.bytes.size(), "rb");
+  CHECK(f);
+  Reader r(f);
+  const std::uint8_t* msg;
+  std::uint16_t len;
+  while (r.next(msg, len)) CHECK(dispatch(msg, len, replay));
+  std::fclose(f);
+  CHECK(replay.stats.unexpected_trades == 1 && replay.crosses.size() == 1);
+  const CrossEvent& c = replay.crosses[0];
+  CHECK(c.locate == 3 && c.timestamp == 4 && c.kind == 'A' && c.state == 'H' && c.phase == 'Q');
+  CHECK(c.side == 'B' && c.price == 101'000 && c.touch == 100'000 && c.traded == 40);
+  CHECK(replay.name(3) == "HALT");
+}
+
 int main() {
   round_trip_every_type();
   malformed_input_is_reported();
   synthetic_day_replays_cleanly();
+  crossing_add_is_traced();
   std::puts("itch: OK");
 }

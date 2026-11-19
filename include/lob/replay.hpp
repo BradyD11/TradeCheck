@@ -19,6 +19,19 @@ struct ReplayStats {
   std::uint64_t front_agree = 0;        // ...that hit the order our price-time priority says is next
 };
 
+// Context for an add/replace that traded in our engine although Nasdaq's book didn't cross.
+struct CrossEvent {
+  std::uint16_t locate;
+  std::uint64_t timestamp;
+  char kind;   // 'A' add or 'U' replace
+  char state;  // the symbol's last 'H' trading state ('?' if none seen)
+  char phase;  // the last 'S' system event code
+  char side;   // 'B' or 'S'
+  std::uint32_t price;
+  Price touch;  // best opposite price it hit
+  Qty traded;
+};
+
 class Replayer : public itch::NullHandler {
  public:
   // hist may be null to skip timing.
@@ -31,7 +44,11 @@ class Replayer : public itch::NullHandler {
     std::string s(m.stock, 8);
     s.erase(s.find_last_not_of(' ') + 1);
     if (s == symbol_) filter_ = m.h.locate;
+    names_[m.h.locate] = std::move(s);
   }
+
+  void on(const itch::SystemEvent& m) { phase_ = m.code; }
+  void on(const itch::TradingAction& m) { state_[m.h.locate] = m.state; }
 
   void on(const itch::AddOrder& m) {
     if (skip(m.h)) return;
@@ -39,7 +56,7 @@ class Replayer : public itch::NullHandler {
     OrderBook& b = book(m.h.locate);
     Result r = timed([&] { return b.limit(m.ref, side(m.side), m.price, m.shares); });
     if (r.status != Status::Ok) ++stats.rejected;
-    if (!b.trades().empty()) ++stats.unexpected_trades;
+    if (!b.trades().empty()) crossed(b, m.h, 'A', m.side, m.price, r.filled);
   }
 
   void on(const itch::OrderExecuted& m) {
@@ -74,8 +91,11 @@ class Replayer : public itch::NullHandler {
     if (skip(m.h)) return;
     ++stats.replaces;
     OrderBook& b = book(m.h.locate);
-    count(timed([&] { return b.replace(m.orig_ref, m.new_ref, m.price, m.shares); }));
-    if (!b.trades().empty()) ++stats.unexpected_trades;
+    const Order* old = b.find(m.orig_ref);
+    char s = old && old->side == Side::Buy ? 'B' : 'S';
+    Result r = timed([&] { return b.replace(m.orig_ref, m.new_ref, m.price, m.shares); });
+    count(r);
+    if (!b.trades().empty()) crossed(b, m.h, 'U', s, m.price, r.filled);
   }
 
   const OrderBook* book_for(std::uint16_t locate) const { return books_[locate].get(); }
@@ -87,7 +107,10 @@ class Replayer : public itch::NullHandler {
     return true;
   }
 
+  const std::string& name(std::uint16_t locate) const { return names_[locate]; }
+
   ReplayStats stats;
+  std::vector<CrossEvent> crosses;
 
  private:
   static Side side(char c) { return c == 'B' ? Side::Buy : Side::Sell; }
@@ -98,6 +121,12 @@ class Replayer : public itch::NullHandler {
     auto& b = books_[locate];
     if (!b) b = std::make_unique<OrderBook>();
     return *b;
+  }
+
+  void crossed(const OrderBook& b, const itch::Header& h, char kind, char side, std::uint32_t price, Qty filled) {
+    ++stats.unexpected_trades;
+    crosses.push_back({h.locate, h.timestamp, kind, state_[h.locate], phase_, side, price, b.trades().front().price,
+                       filled});
   }
 
   void count(const Result& r) {
@@ -120,7 +149,10 @@ class Replayer : public itch::NullHandler {
   LatencyHistogram* hist_;
   std::string symbol_;
   std::uint16_t filter_ = 0;
+  char phase_ = '?';
   std::vector<std::unique_ptr<OrderBook>> books_;
+  std::vector<std::string> names_ = std::vector<std::string>(65536);
+  std::vector<char> state_ = std::vector<char>(65536, '?');
 };
 
 }  // namespace lob
