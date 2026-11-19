@@ -20,7 +20,7 @@ inline std::vector<std::uint8_t> simulate(std::size_t messages, std::size_t symb
   std::vector<std::string> names;
   std::uint64_t ts = 34'200'000'000'000;  // 09:30:00
   for (std::size_t s = 0; s < symbols; ++s) {
-    char name[9];
+    char name[24];  // GCC can't see that s <= 65535 keeps it at 8 chars
     std::snprintf(name, sizeof name, "SYM%04zu", s);
     names.emplace_back(name);
     w.stock_directory(static_cast<std::uint16_t>(s + 1), ts, name);
