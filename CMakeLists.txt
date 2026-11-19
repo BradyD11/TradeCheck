@@ -19,8 +19,9 @@ target_include_directories(lob PUBLIC include)
 
 add_executable(itch_replay tools/itch_replay.cpp)
 add_executable(gen_itch tools/gen_itch.cpp)
+add_executable(itch_dump tools/itch_dump.cpp)
 add_executable(bench_matching bench/bench_matching.cpp)
-foreach(t itch_replay gen_itch bench_matching)
+foreach(t itch_replay itch_dump gen_itch bench_matching)
   target_link_libraries(${t} lob)
 endforeach()
 
@@ -35,7 +36,8 @@ endforeach()
 #   1: LIFO instead of FIFO within a price level
 #   2: a share disappears on partial fill
 #   3: no match at exactly the limit price (book can lock)
-foreach(m 1 2 3)
+#   4: auction ignores the minimum-imbalance tie-break
+foreach(m 1 2 3 4)
   add_library(lob_mutant${m} STATIC src/order_book.cpp)
   target_include_directories(lob_mutant${m} PUBLIC include)
   target_compile_definitions(lob_mutant${m} PRIVATE LOB_MUTANT=${m})

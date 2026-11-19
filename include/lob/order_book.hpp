@@ -35,6 +35,14 @@ struct Result {
   bool operator==(const Result&) const = default;
 };
 
+// Outcome of a single-price auction.
+struct Auction {
+  Price price;
+  std::uint64_t volume;     // shares that trade
+  std::uint64_t imbalance;  // eligible shares left unmatched at that price
+  bool operator==(const Auction&) const = default;
+};
+
 struct Level;
 
 struct Order {
@@ -74,6 +82,14 @@ class OrderBook {
   void set_halted(bool halted) { halted_ = halted; }
   bool halted() const { return halted_; }
 
+  // Single-price auction over the crossed part of the book. Candidate prices are the resting
+  // level prices; pick the one that (1) trades the most shares, then (2) leaves the smallest
+  // imbalance, then (3) is closest to `reference`, then (4) is lower. nullopt if nothing crosses.
+  std::optional<Auction> indicative(Price reference) const;
+  // Runs that auction: bids best price then oldest first against asks the same way, all at one
+  // price. Trades report the buy order as taker and the sell order as maker. Leaves the book uncrossed.
+  std::optional<Auction> uncross(Price reference);
+
   // Trades produced by the most recent call.
   const std::vector<Trade>& trades() const { return trades_; }
 
@@ -108,6 +124,7 @@ class OrderBook {
   template <class Book>
   void rest(Book& book, OrderId id, Side side, Price price, Qty qty);
   static void detach(Level& level, Order* o);
+  void fill(Order* o, Qty qty);
   void remove(Order* o);
   Order* alloc();
 

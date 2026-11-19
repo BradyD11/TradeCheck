@@ -11,6 +11,7 @@ using namespace lob;
 using namespace lob::itch;
 
 struct Recorder : NullHandler {
+  using NullHandler::on;
   std::vector<char> types;
   std::vector<AddOrder> adds;
   std::vector<OrderExecuted> execs;
@@ -153,10 +154,37 @@ static void halts_follow_trading_state() {
   CHECK(resumed.check_all_invariants());
 }
 
+// At a halt cross, the replayer runs our auction on our book and records it beside Nasdaq's print.
+static void halt_cross_is_compared() {
+  Writer w;
+  w.stock_directory(3, 1, "HALT");
+  w.add(3, 2, 1, 'S', 100, "HALT", 100'000);
+  w.add(3, 3, 2, 'B', 100, "HALT", 99'000);
+  w.executed(3, 4, 1, 10, 1);  // last execution before the pause: $10.00
+  w.trading_action(3, 5, "HALT", 'P');
+  w.add(3, 6, 3, 'B', 50, "HALT", 101'000);
+  w.imbalance(3, 7, 50, 0, 'N', "HALT", 100'000, 100'000, 100'000, 'H');  // agrees with us
+  w.imbalance(3, 8, 70, 0, 'N', "HALT", 100'500, 100'500, 100'500, 'H');  // hidden size: disagrees
+  w.cross_trade(3, 9, 50, "HALT", 100'000, 2, 'H');
+  w.trading_action(3, 9, "HALT", 'T');
+  w.executed_with_price(3, 9, 1, 50, 3, 100'000);
+  w.executed_with_price(3, 9, 3, 50, 4, 100'000);
+  Replayer replay;
+  replay_bytes(w.bytes, replay);
+  CHECK(replay.crosses_checked.size() == 1);
+  const CrossCheck& c = replay.crosses_checked[0];
+  CHECK(c.type == 'H' && c.nasdaq_price == 100'000 && c.nasdaq_shares == 50 && c.reference == 100'000);
+  CHECK(c.ours && (*c.ours == Auction{100'000, 50, 40}));  // $10.00 and $10.10 tie; reference picks $10.00
+  CHECK(replay.noii.checks == 2 && replay.noii.price_agree == 1 && replay.noii.paired_agree == 1);
+  CHECK(replay.stats.unknown_refs == 0 && replay.stats.unexpected_trades == 0);
+  CHECK(replay.check_all_invariants());
+}
+
 int main() {
   round_trip_every_type();
   malformed_input_is_reported();
   synthetic_day_replays_cleanly();
   halts_follow_trading_state();
+  halt_cross_is_compared();
   std::puts("itch: OK");
 }

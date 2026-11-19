@@ -1,6 +1,7 @@
 #pragma once
 // Feeds ITCH order flow into one OrderBook per instrument and checks it against Nasdaq's own book.
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,24 @@ struct CrossEvent {
   Qty traded;
 };
 
+// Our auction on our book at the moment Nasdaq printed a cross ('Q' arrives before the cross's executions).
+struct CrossCheck {
+  std::uint16_t locate;
+  std::uint64_t timestamp;
+  char type;  // O opening, C closing, H halt/IPO reopening
+  std::uint32_t nasdaq_price;
+  std::uint64_t nasdaq_shares;
+  std::optional<Auction> ours;
+  Price reference;
+};
+
+// Our indicative auction vs each 'I' imbalance message during a halt.
+struct NoiiStats {
+  std::uint64_t checks = 0;
+  std::uint64_t price_agree = 0;   // our clearing price == Nasdaq's near price
+  std::uint64_t paired_agree = 0;  // our volume == Nasdaq's paired shares
+};
+
 class Replayer : public itch::NullHandler {
  public:
   // hist may be null to skip timing.
@@ -48,6 +67,24 @@ class Replayer : public itch::NullHandler {
   }
 
   void on(const itch::SystemEvent& m) { phase_ = m.code; }
+
+  void on(const itch::CrossTrade& m) {
+    if (skip(m.h)) return;
+    OrderBook& b = book(m.h.locate);
+    Price ref = reference(b, m.h.locate);
+    crosses_checked.push_back({m.h.locate, m.h.timestamp, m.cross_type, m.price, m.shares, b.indicative(ref), ref});
+    if (m.price) last_price_[m.h.locate] = m.price;
+  }
+
+  void on(const itch::Imbalance& m) {
+    if (skip(m.h) || m.cross_type != 'H') return;
+    OrderBook& b = book(m.h.locate);
+    if (!b.halted()) return;
+    auto a = b.indicative(reference(b, m.h.locate));
+    ++noii.checks;
+    noii.price_agree += a ? a->price == Price(m.near_price) : m.near_price == 0;
+    noii.paired_agree += (a ? a->volume : 0) == m.paired;
+  }
   // Nasdaq doesn't match a paused, halted or quotation-only symbol, so neither do we.
   void on(const itch::TradingAction& m) {
     state_[m.h.locate] = m.state;
@@ -76,6 +113,7 @@ class Replayer : public itch::NullHandler {
       ++stats.front_checks;
       stats.front_agree += b.front(o->side) == o;
     }
+    last_price_[m.h.locate] = m.has_price ? Price(m.price) : o->price;
     timed([&] { return b.reduce(m.ref, m.shares); });
   }
 
@@ -115,9 +153,18 @@ class Replayer : public itch::NullHandler {
 
   ReplayStats stats;
   std::vector<CrossEvent> crosses;
+  std::vector<CrossCheck> crosses_checked;
+  NoiiStats noii;
 
  private:
   static Side side(char c) { return c == 'B' ? Side::Buy : Side::Sell; }
+
+  // Auction tie-break: the last execution before the halt, else the middle of the crossed range.
+  Price reference(const OrderBook& b, std::uint16_t locate) const {
+    if (last_price_[locate]) return last_price_[locate];
+    if (b.best_bid() && b.best_ask()) return (*b.best_bid() + *b.best_ask()) / 2;
+    return 0;
+  }
 
   bool skip(const itch::Header& h) const { return !symbol_.empty() && h.locate != filter_; }
 
@@ -157,6 +204,7 @@ class Replayer : public itch::NullHandler {
   std::vector<std::unique_ptr<OrderBook>> books_;
   std::vector<std::string> names_ = std::vector<std::string>(65536);
   std::vector<char> state_ = std::vector<char>(65536, '?');
+  std::vector<Price> last_price_ = std::vector<Price>(65536, 0);
 };
 
 }  // namespace lob

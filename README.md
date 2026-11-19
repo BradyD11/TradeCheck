@@ -3,7 +3,8 @@
 A price-time priority limit order book and matching engine in C++20, with a Nasdaq TotalView-ITCH 5.0 replayer.
 
 - **Orders:** limit (GTC), IOC, market, cancel, partial cancel, and cancel/replace.
-- **Correctness:** every operation is checked against a brute-force model. The book can never cross, and shares are never created or lost. Three deliberately broken builds of the engine prove that these tests can catch real bugs.
+- **Halts and auctions:** books halt during trading pauses and reopen through a single-price uncross auction, the same kind exchanges run at the open, the close and after a halt.
+- **Correctness:** every operation, auctions included, is checked against a brute-force model. The book can never cross while trading, and shares are never created or lost. Four deliberately broken builds of the engine prove that these tests can catch real bugs.
 - **Real data:** replays a full Nasdaq trading day (368M ITCH messages). The engine's book never disagrees with Nasdaq's: 0 unknown order refs and 0 unexpected trades. On 99.91% of 8.1M executions, it picked the same order Nasdaq actually executed.
 - **Latency:** p50, p99 and p99.9 for each operation type. The histogram uses constant memory, so a full trading day fits.
 
@@ -31,7 +32,8 @@ ctest --test-dir build --output-on-failure
 - **Priority:** best price first, then arrival time. `reduce` (a partial cancel or execution) keeps the order's queue position. `replace` loses it, which is Nasdaq's rule for `U` messages.
 - **Cancel** is O(1): one hash lookup and one unlink. The level is erased when its last order leaves.
 - **Matching** pops orders from the head of the level and reuses their slots, so the hot path doesn't allocate once the pool has warmed up.
-- **Halts:** while a book is halted (a trading pause, a halt, or a quotation-only period), orders rest without matching and the book may cross. IOC and market orders are cancelled. Resuming doesn't uncross the book. That's the venue's reopening auction, which isn't built here. In replay, Nasdaq's own cross executions clear it.
+- **Halts:** while a book is halted (a trading pause, a halt, or a quotation-only period), orders rest without matching and the book may cross. IOC and market orders are cancelled.
+- **Auctions:** `indicative(ref)` gives the clearing price without trading, and `uncross(ref)` executes it. The price is chosen by four rules in order: trade the most shares; then leave the smallest imbalance; then be closest to the reference price; then be lower. Bids fill best price first, then oldest first, against asks done the same way, all at one price. Only resting level prices are candidates. In replay, the book mirrors Nasdaq, so Nasdaq's own cross executions clear it and the auction runs only to be compared against Nasdaq's.
 - **One thread per book**, by design. Real matching engines shard instruments across cores instead of locking a book.
 - **Result accounting:** every call returns `{filled, rested, cancelled}`, and those always add up to the order's quantity. The conservation test is built on this.
 
@@ -39,12 +41,13 @@ ctest --test-dir build --output-on-failure
 
 | Test | What it checks |
 |---|---|
-| `unit` | Hand-checked scenarios: price before time, sweeping several levels, IOC and market remainders, rejects, priority after reduce and replace, slot reuse, halted books resting crossing orders |
-| `property` | 300 seeds × 2,000 random operations (600k ops), with random halts and resumes mixed in. After **every** op: results, trades and the full depth of book are identical to a brute-force model; `check_invariants()` passes (never crossed or locked while trading, links consistent, level totals right); and `submitted == resting + 2·traded + cancelled` |
-| `itch` | Encode/decode round trip for every message type, including reads split across buffer boundaries down to 1 byte at a time; truncated files and short messages are reported instead of read past; a 200k-message synthetic day replays with zero unknown refs and 100% FIFO agreement; a paused symbol's book crosses without trading, and a crossing add after it resumes is traced |
+| `unit` | Hand-checked scenarios: price before time, sweeping several levels, IOC and market remainders, rejects, priority after reduce and replace, slot reuse, halted books resting crossing orders, auction price rules worked out by hand |
+| `property` | 300 seeds × 2,000 random operations (600k ops), with random halts mixed in. Every resume runs a reopening auction, whose price, volume, imbalance and trades must match a brute-force auction that scans every resting price. After **every** op: results, trades and the full depth of book are identical to a brute-force model; `check_invariants()` passes (never crossed or locked while trading, links consistent, level totals right); and `submitted == resting + 2·traded + cancelled` |
+| `itch` | Encode/decode round trip for every message type, including reads split across buffer boundaries down to 1 byte at a time; truncated files and short messages are reported instead of read past; a 200k-message synthetic day replays with zero unknown refs and 100% FIFO agreement; a paused symbol's book crosses without trading, and a crossing add after it resumes is traced; a halt cross and its imbalance messages are compared against our auction |
 | `mutant1_is_caught` | Engine built with LIFO instead of FIFO in a level → the property test fails at step 5 ("trades differ") |
 | `mutant2_is_caught` | Engine that drops one share on each partial fill → fails at step 1 ("invariant violated") |
 | `mutant3_is_caught` | Engine that won't match at exactly the limit price → fails at step 13 ("result differs") |
+| `mutant4_is_caught` | Auction that skips the minimum-imbalance tie-break → fails at step 149 ("indicative auction differs") |
 
 The mutants are the same `src/order_book.cpp` compiled with `-DLOB_MUTANT=N`, and CTest expects them to fail (`WILL_FAIL`). If someone weakens the property test so that a mutant slips through, `ctest` fails.
 
@@ -109,6 +112,29 @@ How to read this:
 - **Real-day latency is higher than the synthetic one.** Mean 286 ns vs 204 ns, because a real day has more symbols and a bigger working set, and so more cache misses.
 - **gunzip isn't the bottleneck.** The untimed AAPL pass read the same file at 18.8M msg/s.
 
+### Auctions vs Nasdaq's crosses (same day)
+
+Nasdaq prints each cross as an ITCH `Q` message. The `Q` arrives before the cross's individual executions, so at that moment our book still holds the crossed state from before the auction. The replayer runs `indicative()` right then. The reference price is the symbol's last execution before the halt.
+
+| | count | our result |
+|---|---:|---|
+| Halt/IPO reopening crosses | 4 | price matched 0 of 4 |
+| `I` imbalance messages during halts | 18,601 | clearing price agreed 66.0%, paired shares agreed 65.7% |
+| Opening and closing crosses | 5,430 | our book crossed in 0 of them |
+
+All three rows come down to **liquidity the feed doesn't show**. ITCH only shows displayed orders. Hidden orders take part in a cross but never appear as adds. SXTC's two reopenings show how much that matters. From the cross executions printed right after each `Q`:
+
+| SXTC cross | Nasdaq | ours | displayed buy / sell that executed | hidden buy / sell |
+|---|---:|---:|---:|---:|
+| 10:32:49 | 11,813 @ $5.82 | 6,779 @ $5.84 | 8,483 / 6,779 | 3,330 / 5,034 |
+| 11:49:22 | 12,056 @ $7.51 | 1,092 @ $7.64 | 6,261 / 465 | 5,795 / 11,591 |
+
+- **The displayed side matches exactly.** In the first cross, our volume of 6,779 equals the displayed sell shares Nasdaq executed. Our book has the right orders. It's missing the 43% of the sell side that was hidden, and that hidden size moved the clearing price 2 cents.
+- **Imbalance agreement shows how often hidden size mattered.** Agreement is 66%: during about a third of the halted seconds, hidden size changed the answer.
+- **The open and close are mostly orders ITCH never shows.** Market-on-open and market-on-close orders are never displayed, and pre-market trading keeps the displayed book uncrossed. So a displayed-only book has nothing to auction at 09:30 or 16:00.
+
+The auction logic is checked against the brute-force model on random books. These real-data numbers measure **how much of the market the public feed lets you see**, not whether the auction is coded right. Matching Nasdaq's crosses exactly would need order-level data with hidden orders, which ITCH doesn't publish.
+
 ### ITCH replay (synthetic day: 20M messages, 200 symbols)
 
 | | |
@@ -136,6 +162,8 @@ gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay -
 gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay - --symbol AAPL
 # list every add that crossed our book, with its symbol state and time
 gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_replay - --no-timing --trace
+# every message for one symbol (halts, imbalance updates, crosses, executions)
+gunzip -c 01302019.NASDAQ_ITCH50.gz | ./build/itch_dump - SXTC
 ```
 
 The replayer feeds `A`/`F` adds, `E`/`C` executions, `X` partial cancels, `D` deletes and `U` replaces into one `OrderBook` per instrument, then reports these checks:
@@ -162,7 +190,7 @@ include/lob/itch.hpp         ITCH 5.0 decoder, streaming reader, encoder
 include/lob/replay.hpp       ITCH → OrderBook, with the agreement checks
 include/lob/itch_sim.hpp     synthetic ITCH generator
 include/lob/latency.hpp      constant-memory latency histogram
-tools/                       itch_replay, gen_itch
+tools/                       itch_replay, itch_dump (every message for one symbol), gen_itch
 bench/                       bench_matching
 tests/                       unit, property (+ mutants), itch
 ```

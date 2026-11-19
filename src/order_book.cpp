@@ -146,12 +146,7 @@ Result OrderBook::reduce(OrderId id, Qty qty) {
   Order* o = it->second;
   Result r;
   r.cancelled = std::min(qty, o->qty);
-  if (r.cancelled == o->qty) {
-    remove(o);
-  } else {
-    o->qty -= r.cancelled;
-    o->level->total -= r.cancelled;
-  }
+  fill(o, r.cancelled);
   return r;
 }
 
@@ -167,6 +162,72 @@ Result OrderBook::replace(OrderId old_id, OrderId new_id, Price price, Qty qty) 
   Result r = submit(new_id, side, price, qty, Tif::GTC);
   r.cancelled += removed;
   return r;
+}
+
+void OrderBook::fill(Order* o, Qty qty) {
+  if (qty == o->qty) {
+    remove(o);
+  } else {
+    o->qty -= qty;
+    o->level->total -= qty;
+  }
+}
+
+std::optional<Auction> OrderBook::indicative(Price reference) const {
+  if (bids_.empty() || asks_.empty() || bids_.begin()->first < asks_.begin()->first) return std::nullopt;
+  Price lo = asks_.begin()->first, hi = bids_.begin()->first;
+  // Only levels inside [lo, hi] can trade.
+  std::vector<std::pair<Price, std::uint64_t>> bids, asks;  // best first
+  for (const auto& [p, l] : bids_) {
+    if (p < lo) break;
+    bids.emplace_back(p, l.total);
+  }
+  for (const auto& [p, l] : asks_) {
+    if (p > hi) break;
+    asks.emplace_back(p, l.total);
+  }
+  std::optional<Auction> best;
+  auto consider = [&](Price p) {
+    // shortcut: O(levels^2) in the crossed region, which is a few hundred levels at most after a pause.
+    std::uint64_t buy = 0, sell = 0;
+    for (const auto& [bp, q] : bids)
+      if (bp >= p) buy += q;
+    for (const auto& [ap, q] : asks)
+      if (ap <= p) sell += q;
+    Auction a{p, std::min(buy, sell), buy > sell ? buy - sell : sell - buy};
+    auto dist = [&](Price x) { return x > reference ? x - reference : reference - x; };
+    bool better = !best || a.volume > best->volume ||
+                  (a.volume == best->volume &&
+#if LOB_MUTANT == 4
+                   // ignores the imbalance tie-break
+                   (dist(p) < dist(best->price) || (dist(p) == dist(best->price) && p < best->price)));
+#else
+                   (a.imbalance < best->imbalance ||
+                    (a.imbalance == best->imbalance &&
+                     (dist(p) < dist(best->price) || (dist(p) == dist(best->price) && p < best->price)))));
+#endif
+    if (better) best = a;
+  };
+  for (const auto& kv : bids) consider(kv.first);
+  for (const auto& kv : asks) consider(kv.first);
+  return best;
+}
+
+std::optional<Auction> OrderBook::uncross(Price reference) {
+  trades_.clear();
+  std::optional<Auction> a = indicative(reference);
+  if (!a) return a;
+  std::uint64_t left = a->volume;
+  while (left > 0) {
+    Order* b = bids_.begin()->second.head;
+    Order* s = asks_.begin()->second.head;
+    Qty f = static_cast<Qty>(std::min<std::uint64_t>({b->qty, s->qty, left}));
+    trades_.push_back({b->id, s->id, a->price, f});
+    left -= f;
+    fill(b, f);
+    fill(s, f);
+  }
+  return a;
 }
 
 std::optional<Price> OrderBook::best_bid() const {

@@ -103,6 +103,40 @@ int main(int argc, char** argv) {
       }
     }
   }
+  {
+    std::uint64_t n[2] = {}, price_ok[2] = {}, both_ok[2] = {}, seen[2] = {};
+    for (const CrossCheck& c : replay.crosses_checked) {
+      int k = c.type == 'H' ? 0 : 1;
+      if (c.nasdaq_shares == 0) continue;  // no cross happened
+      ++n[k];
+      if (c.ours) ++seen[k];
+      bool p = c.ours && c.ours->price == Price(c.nasdaq_price);
+      price_ok[k] += p;
+      both_ok[k] += p && c.ours->volume == c.nasdaq_shares;
+    }
+    std::printf("halt crosses  %llu: price matches %llu, price and shares match %llu\n", (unsigned long long)n[0],
+                (unsigned long long)price_ok[0], (unsigned long long)both_ok[0]);
+    std::printf("open/close    %llu crosses; our displayed book crossed in %llu (on-open/close orders aren't in ITCH)\n",
+                (unsigned long long)n[1], (unsigned long long)seen[1]);
+    if (replay.noii.checks)
+      std::printf("halt NOII     %llu: near price agrees %.2f%%, paired shares agree %.2f%%\n",
+                  (unsigned long long)replay.noii.checks, 100.0 * replay.noii.price_agree / replay.noii.checks,
+                  100.0 * replay.noii.paired_agree / replay.noii.checks);
+    if (trace && n[0]) {
+      std::printf("    %-8s %-12s %20s %20s %10s\n", "symbol", "time", "nasdaq", "ours", "reference");
+      for (const CrossCheck& c : replay.crosses_checked) {
+        if (c.type != 'H' || c.nasdaq_shares == 0) continue;
+        std::uint64_t t = c.timestamp / 1'000'000;
+        char nasdaq[32], ours[32] = "no cross";
+        std::snprintf(nasdaq, sizeof nasdaq, "%llu @ %.4f", (unsigned long long)c.nasdaq_shares, c.nasdaq_price / 1e4);
+        if (c.ours) std::snprintf(ours, sizeof ours, "%llu @ %.4f", (unsigned long long)c.ours->volume, c.ours->price / 1e4);
+        std::printf("    %-8s %02llu:%02llu:%02llu.%03llu %20s %20s %10.4f\n", replay.name(c.locate).c_str(),
+                    (unsigned long long)(t / 3'600'000), (unsigned long long)(t / 60'000 % 60),
+                    (unsigned long long)(t / 1000 % 60), (unsigned long long)(t % 1000), nasdaq, ours,
+                    c.reference / 1e4);
+      }
+    }
+  }
   std::printf("invariants    %s\n", replay.check_all_invariants() ? "OK" : "VIOLATED");
   if (timing) {
     std::printf("\nper-op latency (book op only, excludes parsing):\n");

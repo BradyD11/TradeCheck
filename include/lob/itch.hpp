@@ -54,6 +54,25 @@ struct OrderDelete {  // 'D'
   Header h;
   std::uint64_t ref;
 };
+struct CrossTrade {  // 'Q': the bulk print of an opening, closing or halt/IPO cross
+  Header h;
+  std::uint64_t shares;
+  char stock[8];
+  std::uint32_t price;
+  std::uint64_t match;
+  char cross_type;  // O opening, C closing, H halt/IPO, I intraday/post-close
+};
+struct Imbalance {  // 'I': net order imbalance indicator before a cross
+  Header h;
+  std::uint64_t paired;
+  std::uint64_t imbalance;
+  char direction;  // B buy, S sell, N none, O insufficient orders
+  char stock[8];
+  std::uint32_t far_price;
+  std::uint32_t near_price;
+  std::uint32_t reference_price;
+  char cross_type;
+};
 struct SystemEvent {  // 'S'
   Header h;
   char code;  // O start, S system open 04:00, Q market open 09:30, M market close 16:00, E system close, C end
@@ -84,6 +103,8 @@ constexpr std::size_t size_of(char type) {
     case 'U': return 35;
     case 'S': return 12;
     case 'H': return 25;
+    case 'Q': return 40;
+    case 'I': return 50;
     default: return 0;
   }
 }
@@ -97,6 +118,8 @@ struct NullHandler {
   void on(const OrderReplace&) {}
   void on(const SystemEvent&) {}
   void on(const TradingAction&) {}
+  void on(const CrossTrade&) {}
+  void on(const Imbalance&) {}
 };
 
 // Returns false for a message shorter than its type requires. Unused types are skipped.
@@ -133,6 +156,19 @@ bool dispatch(const std::uint8_t* p, std::size_t len, H& h) {
     case 'D': h.on(OrderDelete{hd, be(b, 8)}); break;
     case 'U': h.on(OrderReplace{hd, be(b, 8), be(b + 8, 8), be32(b + 16), be32(b + 20)}); break;
     case 'S': h.on(SystemEvent{hd, static_cast<char>(b[0])}); break;
+    case 'Q': {
+      CrossTrade m{hd, be(b, 8), {}, be32(b + 16), be(b + 20, 8), static_cast<char>(b[28])};
+      std::memcpy(m.stock, b + 8, 8);
+      h.on(m);
+      break;
+    }
+    case 'I': {
+      Imbalance m{hd, be(b, 8), be(b + 8, 8), static_cast<char>(b[16]), {}, be32(b + 25), be32(b + 29), be32(b + 33),
+                  static_cast<char>(b[37])};
+      std::memcpy(m.stock, b + 17, 8);
+      h.on(m);
+      break;
+    }
     case 'H': {
       TradingAction m{hd, {}, static_cast<char>(b[8])};
       std::memcpy(m.stock, b, 8);
@@ -237,6 +273,30 @@ class Writer {
     auto s = start('D', locate, ts);
     put(ref, 8);
     finish(s, 'D');
+  }
+  void cross_trade(std::uint16_t locate, std::uint64_t ts, std::uint64_t shares, std::string_view stock,
+                   std::uint32_t price, std::uint64_t match, char cross_type) {
+    auto s = start('Q', locate, ts);
+    put(shares, 8);
+    put_stock(stock);
+    put(price, 4);
+    put(match, 8);
+    put(static_cast<std::uint8_t>(cross_type), 1);
+    finish(s, 'Q');
+  }
+  void imbalance(std::uint16_t locate, std::uint64_t ts, std::uint64_t paired, std::uint64_t imbalance, char direction,
+                 std::string_view stock, std::uint32_t far, std::uint32_t near, std::uint32_t reference,
+                 char cross_type) {
+    auto s = start('I', locate, ts);
+    put(paired, 8);
+    put(imbalance, 8);
+    put(static_cast<std::uint8_t>(direction), 1);
+    put_stock(stock);
+    put(far, 4);
+    put(near, 4);
+    put(reference, 4);
+    put(static_cast<std::uint8_t>(cross_type), 1);
+    finish(s, 'I');  // price variation indicator is zero
   }
   void system_event(std::uint64_t ts, char code) {
     auto s = start('S', 0, ts);

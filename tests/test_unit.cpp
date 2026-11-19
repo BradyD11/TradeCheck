@@ -100,6 +100,36 @@ static void halted_book_rests_without_matching() {
   CHECK((b.limit(5, Side::Buy, 100, 20) == Result{Status::Ok, 20, 0, 0}));
 }
 
+static void auction_picks_max_volume_then_min_imbalance_then_reference() {
+  OrderBook b;
+  b.set_halted(true);
+  b.limit(1, Side::Buy, 102, 100);
+  b.limit(2, Side::Buy, 101, 200);
+  b.limit(3, Side::Buy, 100, 300);
+  b.limit(4, Side::Sell, 99, 250);
+  b.limit(5, Side::Sell, 101, 150);
+  // price  buy>=p  sell<=p  volume  imbalance
+  //   99    600     250      250      350
+  //  100    600     250      250      350
+  //  101    300     400      300      100   <- most volume
+  //  102    100     400      100      300
+  CHECK((b.indicative(0) == Auction{101, 300, 100}));
+  CHECK((b.indicative(1000) == Auction{101, 300, 100}));  // reference only breaks ties
+  CHECK((b.uncross(0) == Auction{101, 300, 100}));
+  CHECK((b.trades() == T{{1, 4, 101, 100}, {2, 4, 101, 150}, {2, 5, 101, 50}}));
+  CHECK(b.best_bid() == 100 && b.best_ask() == 101 && b.find(5)->qty == 100);
+  b.set_halted(false);
+  CHECK(b.check_invariants());
+  CHECK(!b.indicative(0) && !b.uncross(0) && b.trades().empty());  // nothing crosses now
+
+  OrderBook t;  // equal volume and imbalance at 100 and 101: the reference decides
+  t.set_halted(true);
+  t.limit(1, Side::Buy, 101, 100);
+  t.limit(2, Side::Sell, 100, 100);
+  CHECK((t.indicative(0) == Auction{100, 100, 0}));
+  CHECK((t.indicative(200) == Auction{101, 100, 0}));
+}
+
 int main() {
   price_then_time_priority();
   remainder_rests_at_limit();
@@ -109,5 +139,6 @@ int main() {
   reduce_keeps_priority_replace_loses_it();
   freed_slots_are_reused();
   halted_book_rests_without_matching();
+  auction_picks_max_volume_then_min_imbalance_then_reference();
   std::puts("unit: OK");
 }

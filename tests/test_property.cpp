@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -109,6 +111,51 @@ struct Model {
     r.cancelled += removed;
     return r;
   }
+  // Every resting price is a candidate; scan all orders for each one.
+  std::optional<Auction> indicative(Price ref) const {
+    std::optional<Auction> best;
+    for (const auto& c : orders) {
+      std::uint64_t buy = 0, sell = 0;
+      for (const auto& o : orders) {
+        if (o.side == Side::Buy && o.price >= c.price) buy += o.qty;
+        if (o.side == Side::Sell && o.price <= c.price) sell += o.qty;
+      }
+      Auction a{c.price, std::min(buy, sell), buy > sell ? buy - sell : sell - buy};
+      if (a.volume == 0) continue;
+      auto key = [&](const Auction& x) {
+        Price d = x.price > ref ? x.price - ref : ref - x.price;
+        return std::make_tuple(~x.volume, x.imbalance, d, x.price);  // smaller is better
+      };
+      if (!best || key(a) < key(*best)) best = a;
+    }
+    return best;
+  }
+  std::optional<Auction> uncross(Price ref) {
+    trades.clear();
+    std::optional<Auction> a = indicative(ref);
+    if (!a) return a;
+    auto by_priority = [](const O& x, const O& y) {
+      if (x.price != y.price) return x.side == Side::Buy ? x.price > y.price : x.price < y.price;
+      return x.seq < y.seq;
+    };
+    std::uint64_t left = a->volume;
+    while (left > 0) {
+      O *b = nullptr, *s = nullptr;
+      for (auto& o : orders) {
+        O*& slot = o.side == Side::Buy ? b : s;
+        if (!slot || by_priority(o, *slot)) slot = &o;
+      }
+      Qty f = static_cast<Qty>(std::min<std::uint64_t>({b->qty, s->qty, left}));
+      trades.push_back({b->id, s->id, a->price, f});
+      left -= f;
+      b->qty -= f;
+      s->qty -= f;
+      OrderId bid = b->id, sid = s->id;
+      if (find(bid)->qty == 0) erase(bid);
+      if (find(sid)->qty == 0) erase(sid);
+    }
+    return a;
+  }
   Levels levels(Side side) const {
     std::map<Price, std::uint64_t> m;
     for (const auto& o : orders)
@@ -143,14 +190,21 @@ static bool run(std::uint64_t seed, int steps) {
   auto new_id = [&]() -> OrderId { return rng() % 20 == 0 ? some_id() : next++; };
 
   for (int step = 0; step < steps; ++step) {
-    // Occasionally halt, or resume once cancels have uncrossed the book (resuming never uncrosses it).
+    // Occasionally halt; resume through a reopening auction that must match the model exactly.
     if (rng() % 40 == 0) {
-      Levels bids = model.levels(Side::Buy), asks = model.levels(Side::Sell);
-      bool crossed = !bids.empty() && !asks.empty() && bids[0].first >= asks[0].first;
-      if (!model.halted || !crossed) {
-        model.halted = !model.halted;
-        book.set_halted(model.halted);
+      if (model.halted) {
+        Price ref = 95 + static_cast<Price>(rng() % 11);
+        Levels bids = model.levels(Side::Buy), asks = model.levels(Side::Sell);
+        bool crossed = !bids.empty() && !asks.empty() && bids[0].first >= asks[0].first;
+        if (book.indicative(ref) != model.indicative(ref)) return fail(step, "indicative auction differs from model");
+        if (book.indicative(ref).has_value() != crossed) return fail(step, "indicative disagrees with crossed book");
+        if (book.uncross(ref) != model.uncross(ref)) return fail(step, "auction result differs from model");
+        if (book.trades() != model.trades) return fail(step, "auction trades differ from model");
+        for (const Trade& t : book.trades()) traded += t.qty;
       }
+      model.halted = !model.halted;
+      book.set_halted(model.halted);
+      if (!book.check_invariants()) return fail(step, "invariant violated after auction or halt change");
     }
     unsigned roll = rng() % 100;
     Side side = rng() & 1 ? Side::Buy : Side::Sell;
