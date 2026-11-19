@@ -29,6 +29,7 @@ struct Model {
   std::vector<O> orders;
   std::vector<Trade> trades;
   std::uint64_t seq = 0;
+  bool halted = false;
 
   O* find(OrderId id) {
     for (auto& o : orders)
@@ -44,7 +45,7 @@ struct Model {
     if (qty == 0) return {Status::ZeroQty};
     if (find(id)) return {Status::DuplicateId};
     Result r;
-    while (qty > 0) {
+    while (qty > 0 && !halted) {
       O* best = nullptr;
       for (auto& o : orders) {
         if (o.side == side) continue;
@@ -142,6 +143,15 @@ static bool run(std::uint64_t seed, int steps) {
   auto new_id = [&]() -> OrderId { return rng() % 20 == 0 ? some_id() : next++; };
 
   for (int step = 0; step < steps; ++step) {
+    // Occasionally halt, or resume once cancels have uncrossed the book (resuming never uncrosses it).
+    if (rng() % 40 == 0) {
+      Levels bids = model.levels(Side::Buy), asks = model.levels(Side::Sell);
+      bool crossed = !bids.empty() && !asks.empty() && bids[0].first >= asks[0].first;
+      if (!model.halted || !crossed) {
+        model.halted = !model.halted;
+        book.set_halted(model.halted);
+      }
+    }
     unsigned roll = rng() % 100;
     Side side = rng() & 1 ? Side::Buy : Side::Sell;
     Price price = 95 + static_cast<Price>(rng() % 11);  // narrow band so orders cross often

@@ -69,6 +69,11 @@ class OrderBook {
   Result reduce(OrderId id, Qty qty);  // partial cancel or execution report; keeps priority
   Result replace(OrderId old_id, OrderId new_id, Price price, Qty qty);  // loses priority
 
+  // While halted, orders rest without matching (IOC and market remainders are cancelled), so the
+  // book may cross. Resuming does not uncross it: the venue's reopening cross must clear it first.
+  void set_halted(bool halted) { halted_ = halted; }
+  bool halted() const { return halted_; }
+
   // Trades produced by the most recent call.
   const std::vector<Trade>& trades() const { return trades_; }
 
@@ -90,7 +95,7 @@ class OrderBook {
     }
   }
 
-  // Walks the whole structure. For tests, not the hot path.
+  // Walks the whole structure. The book must be uncrossed unless halted. For tests, not the hot path.
   bool check_invariants() const;
 
  private:
@@ -112,6 +117,7 @@ class OrderBook {
   std::deque<Order> pool_;  // stable addresses; freed slots are reused
   std::vector<Order*> free_;
   std::vector<Trade> trades_;
+  bool halted_ = false;
 };
 
 }  // namespace lob

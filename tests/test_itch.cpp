@@ -115,33 +115,48 @@ static void synthetic_day_replays_cleanly() {
   CHECK(replay.check_all_invariants());
 }
 
-// A halted symbol's book can cross on Nasdaq; the replayer must record that with its context.
-static void crossing_add_is_traced() {
-  Writer w;
-  w.system_event(0, 'Q');
-  w.stock_directory(3, 1, "HALT");
-  w.trading_action(3, 2, "HALT", 'H');
-  w.add(3, 3, 1, 'S', 100, "HALT", 100'000);
-  w.add(3, 4, 2, 'B', 40, "HALT", 101'000);  // crosses through the ask
-  Replayer replay;
-  std::FILE* f = fmemopen(w.bytes.data(), w.bytes.size(), "rb");
+static void replay_bytes(std::vector<std::uint8_t>& bytes, Replayer& replay) {
+  std::FILE* f = fmemopen(bytes.data(), bytes.size(), "rb");
   CHECK(f);
   Reader r(f);
   const std::uint8_t* msg;
   std::uint16_t len;
   while (r.next(msg, len)) CHECK(dispatch(msg, len, replay));
   std::fclose(f);
-  CHECK(replay.stats.unexpected_trades == 1 && replay.crosses.size() == 1);
-  const CrossEvent& c = replay.crosses[0];
-  CHECK(c.locate == 3 && c.timestamp == 4 && c.kind == 'A' && c.state == 'H' && c.phase == 'Q');
+}
+
+// A paused symbol's book can cross on Nasdaq without trading. Once trading resumes, a crossing
+// add is a real mismatch and must be traced with its context.
+static void halts_follow_trading_state() {
+  Writer w;
+  w.system_event(0, 'Q');
+  w.stock_directory(3, 1, "HALT");
+  w.trading_action(3, 2, "HALT", 'P');
+  w.add(3, 3, 1, 'S', 100, "HALT", 100'000);
+  w.add(3, 4, 2, 'B', 40, "HALT", 101'000);  // crosses, but the symbol is paused
+  Replayer paused;
+  replay_bytes(w.bytes, paused);
+  CHECK(paused.stats.unexpected_trades == 0 && paused.crosses.empty());
+  CHECK(paused.book_for(3)->halted() && paused.book_for(3)->order_count() == 2);
+  CHECK(paused.check_all_invariants());
+
+  w.trading_action(3, 5, "HALT", 'T');
+  w.del(3, 6, 2);                             // the reopening cross clears the bid
+  w.add(3, 7, 4, 'B', 40, "HALT", 101'000);  // now it really trades in our engine
+  Replayer resumed;
+  replay_bytes(w.bytes, resumed);
+  CHECK(resumed.stats.unexpected_trades == 1 && resumed.crosses.size() == 1);
+  const CrossEvent& c = resumed.crosses[0];
+  CHECK(c.locate == 3 && c.timestamp == 7 && c.kind == 'A' && c.state == 'T' && c.phase == 'Q');
   CHECK(c.side == 'B' && c.price == 101'000 && c.touch == 100'000 && c.traded == 40);
-  CHECK(replay.name(3) == "HALT");
+  CHECK(resumed.name(3) == "HALT" && !resumed.book_for(3)->halted());
+  CHECK(resumed.check_all_invariants());
 }
 
 int main() {
   round_trip_every_type();
   malformed_input_is_reported();
   synthetic_day_replays_cleanly();
-  crossing_add_is_traced();
+  halts_follow_trading_state();
   std::puts("itch: OK");
 }

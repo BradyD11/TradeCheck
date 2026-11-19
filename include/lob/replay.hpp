@@ -48,7 +48,11 @@ class Replayer : public itch::NullHandler {
   }
 
   void on(const itch::SystemEvent& m) { phase_ = m.code; }
-  void on(const itch::TradingAction& m) { state_[m.h.locate] = m.state; }
+  // Nasdaq doesn't match a paused, halted or quotation-only symbol, so neither do we.
+  void on(const itch::TradingAction& m) {
+    state_[m.h.locate] = m.state;
+    if (!skip(m.h)) book(m.h.locate).set_halted(m.state != 'T');
+  }
 
   void on(const itch::AddOrder& m) {
     if (skip(m.h)) return;

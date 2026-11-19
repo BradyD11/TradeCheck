@@ -84,6 +84,22 @@ static void freed_slots_are_reused() {
   }
 }
 
+static void halted_book_rests_without_matching() {
+  OrderBook b;
+  b.limit(1, Side::Sell, 100, 50);
+  b.set_halted(true);
+  CHECK((b.limit(2, Side::Buy, 105, 30) == Result{Status::Ok, 0, 30, 0}));  // crosses, rests
+  CHECK((b.limit(3, Side::Buy, 105, 10, Tif::IOC) == Result{Status::Ok, 0, 0, 10}));
+  CHECK((b.market(4, Side::Buy, 10) == Result{Status::Ok, 0, 0, 10}));
+  CHECK(b.trades().empty() && b.best_bid() == 105 && b.best_ask() == 100);
+  CHECK(b.check_invariants());  // crossed is allowed while halted
+  b.set_halted(false);
+  CHECK(!b.check_invariants());  // ...but not once trading resumes
+  b.cancel(2);
+  CHECK(b.check_invariants());
+  CHECK((b.limit(5, Side::Buy, 100, 20) == Result{Status::Ok, 20, 0, 0}));
+}
+
 int main() {
   price_then_time_priority();
   remainder_rests_at_limit();
@@ -92,5 +108,6 @@ int main() {
   rejects();
   reduce_keeps_priority_replace_loses_it();
   freed_slots_are_reused();
+  halted_book_rests_without_matching();
   std::puts("unit: OK");
 }

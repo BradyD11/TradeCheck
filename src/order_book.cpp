@@ -102,7 +102,8 @@ Result OrderBook::submit(OrderId id, Side side, Price limit, Qty qty, Tif tif) {
   if (qty == 0) return {Status::ZeroQty};
   if (index_.contains(id)) return {Status::DuplicateId};
   Result r;
-  r.filled = side == Side::Buy ? match(asks_, side, limit, qty, id) : match(bids_, side, limit, qty, id);
+  if (!halted_)
+    r.filled = side == Side::Buy ? match(asks_, side, limit, qty, id) : match(bids_, side, limit, qty, id);
   Qty left = qty - r.filled;
   if (left == 0) return r;
   if (tif == Tif::IOC) {
@@ -218,8 +219,8 @@ bool OrderBook::check_invariants() const {
   };
   if (!check_side(bids_, Side::Buy) || !check_side(asks_, Side::Sell)) return false;
   if (n != index_.size()) return false;
-  // Never crossed or locked.
-  if (!bids_.empty() && !asks_.empty() && bids_.begin()->first >= asks_.begin()->first) return false;
+  // Never crossed or locked while trading.
+  if (!halted_ && !bids_.empty() && !asks_.empty() && bids_.begin()->first >= asks_.begin()->first) return false;
   return true;
 }
 

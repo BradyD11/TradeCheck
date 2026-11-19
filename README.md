@@ -4,7 +4,7 @@ A price-time priority limit order book and matching engine in C++20, with a Nasd
 
 - **Orders:** limit (GTC), IOC, market, cancel, partial cancel, and cancel/replace.
 - **Correctness:** every operation is checked against a brute-force model. The book can never cross, and shares are never created or lost. Three deliberately broken builds of the engine prove that these tests can catch real bugs.
-- **Real data:** replays a full Nasdaq trading day (368M ITCH messages). On 99.91% of 8.1M executions, the engine picked the same order Nasdaq actually executed.
+- **Real data:** replays a full Nasdaq trading day (368M ITCH messages). The engine's book never disagrees with Nasdaq's: 0 unknown order refs and 0 unexpected trades. On 99.91% of 8.1M executions, it picked the same order Nasdaq actually executed.
 - **Latency:** p50, p99 and p99.9 for each operation type. The histogram uses constant memory, so a full trading day fits.
 
 No dependencies beyond the standard library and CMake.
@@ -31,6 +31,7 @@ ctest --test-dir build --output-on-failure
 - **Priority:** best price first, then arrival time. `reduce` (a partial cancel or execution) keeps the order's queue position. `replace` loses it, which is Nasdaq's rule for `U` messages.
 - **Cancel** is O(1): one hash lookup and one unlink. The level is erased when its last order leaves.
 - **Matching** pops orders from the head of the level and reuses their slots, so the hot path doesn't allocate once the pool has warmed up.
+- **Halts:** while a book is halted (a trading pause, a halt, or a quotation-only period), orders rest without matching and the book may cross. IOC and market orders are cancelled. Resuming doesn't uncross the book. That's the venue's reopening auction, which isn't built here. In replay, Nasdaq's own cross executions clear it.
 - **One thread per book**, by design. Real matching engines shard instruments across cores instead of locking a book.
 - **Result accounting:** every call returns `{filled, rested, cancelled}`, and those always add up to the order's quantity. The conservation test is built on this.
 
@@ -38,14 +39,14 @@ ctest --test-dir build --output-on-failure
 
 | Test | What it checks |
 |---|---|
-| `unit` | Hand-checked scenarios: price before time, sweeping several levels, IOC and market remainders, rejects, priority after reduce and replace, slot reuse |
-| `property` | 300 seeds × 2,000 random operations (600k ops). After **every** op: results, trades and the full depth of book are identical to a brute-force model; `check_invariants()` passes (never crossed or locked, links consistent, level totals right); and `submitted == resting + 2·traded + cancelled` |
-| `itch` | Encode/decode round trip for every message type, including reads split across buffer boundaries down to 1 byte at a time; truncated files and short messages are reported instead of read past; a 200k-message synthetic day replays with zero unknown refs and 100% FIFO agreement |
+| `unit` | Hand-checked scenarios: price before time, sweeping several levels, IOC and market remainders, rejects, priority after reduce and replace, slot reuse, halted books resting crossing orders |
+| `property` | 300 seeds × 2,000 random operations (600k ops), with random halts and resumes mixed in. After **every** op: results, trades and the full depth of book are identical to a brute-force model; `check_invariants()` passes (never crossed or locked while trading, links consistent, level totals right); and `submitted == resting + 2·traded + cancelled` |
+| `itch` | Encode/decode round trip for every message type, including reads split across buffer boundaries down to 1 byte at a time; truncated files and short messages are reported instead of read past; a 200k-message synthetic day replays with zero unknown refs and 100% FIFO agreement; a paused symbol's book crosses without trading, and a crossing add after it resumes is traced |
 | `mutant1_is_caught` | Engine built with LIFO instead of FIFO in a level → the property test fails at step 5 ("trades differ") |
 | `mutant2_is_caught` | Engine that drops one share on each partial fill → fails at step 1 ("invariant violated") |
 | `mutant3_is_caught` | Engine that won't match at exactly the limit price → fails at step 13 ("result differs") |
 
-The mutants are the same `src/order_book.cpp` compiled with `-DLOB_MUTANT=N`, and CTest expects them to fail (`WILL_FAIL`). If someone weakens the property test so that a mutant slips through, CI goes red.
+The mutants are the same `src/order_book.cpp` compiled with `-DLOB_MUTANT=N`, and CTest expects them to fail (`WILL_FAIL`). If someone weakens the property test so that a mutant slips through, `ctest` fails.
 
 The whole suite also passes under AddressSanitizer and UBSan:
 
@@ -82,18 +83,20 @@ The input is `01302019.NASDAQ_ITCH50.gz`, streamed through `gunzip -c`.
 |---|---:|---:|
 | ITCH messages | 368,366,634 | (same file, filtered) |
 | Book ops applied | 363,118,215 | 1,656,597 |
-| Wall time, including gunzip and parsing | 149 s (2.5M msg/s, timed run) | 19.6 s (18.8M msg/s, untimed) |
-| Book op latency | p50 250 ns · p99 1,459 ns · p99.9 3,000 ns · mean 338 ns | not timed |
+| Wall time, including gunzip and parsing | 131 s (2.8M msg/s, timed run) | 19.6 s (18.8M msg/s, untimed) |
+| Book op latency | p50 209 ns · p99 1,125 ns · p99.9 1,583 ns · mean 286 ns | not timed |
 | Malformed / rejected | 0 / 0 | 0 / 0 |
-| FIFO agreement on `E` executions | **99.913%** (8,089,927 / 8,096,983) | 98.960% (88,174 / 89,101) |
-| Adds that traded in our engine | 97 | 0 |
-| Unknown refs | 137 | 0 |
+| FIFO agreement on `E` executions | **99.913%** (8,089,939 / 8,096,995) | 98.960% (88,174 / 89,101) |
+| Adds that traded in our engine | **0** | 0 |
+| Unknown refs | **0** | 0 |
 | Invariants at end of day | OK | OK (book empty after the close) |
 
 How to read this:
 
 - **The decoder holds up.** It handled all 368M messages with nothing malformed and nothing rejected.
-- **The book mirrors Nasdaq's in normal trading.** Only 97 adds out of 164.7M crossed our book, and only 137 messages referenced an order we no longer had. Tracing them with `--trace` shows that **every crossing add came from a symbol that was not in normal trading**:
+- **The book mirrors Nasdaq's exactly.** No add traded in our engine, and no message referenced an order we didn't have.
+
+  The first version of the replayer got this wrong. It matched every order, and it ended the day with 97 adds that traded and 137 unknown refs. Running `--trace` showed that **every one of those adds came from a symbol that wasn't in normal trading**:
 
   | Symbol state (from ITCH `H` messages) | Crossing adds | Symbols |
   |---|---:|---|
@@ -101,11 +104,9 @@ How to read this:
   | `Q`: quotation only, pre-market | 2 | EYEN |
   | `T`: normal trading | **0** | |
 
-  While a symbol is paused, Nasdaq keeps accepting orders but doesn't match them, so its book can cross until the reopening cross clears it. This engine always matches straight away, so it fills orders that Nasdaq still has resting. Those are the orders that come back later as unknown refs. I haven't traced the 137 individually, though. 15 of the 97 sat exactly at the opposite price and 82 went through it.
-
-  **Fix, not built yet:** while a symbol isn't in state `T`, rest incoming orders without matching them, then run a cross when trading resumes. That means the "never crossed" invariant has to apply only to symbols in state `T`.
+  While a symbol is paused, Nasdaq keeps accepting orders but doesn't match them, so its book can cross until the reopening cross clears it. The engine was filling orders Nasdaq still had resting, and those came back later as unknown refs. The fix is to halt a book whenever its symbol's ITCH state isn't `T`. That took both counts to zero. It also found 12 more executions whose orders used to be missing.
 - **The FIFO gap is real exchange behaviour.** About 0.09% of executions hit an order other than the oldest order at the best price. That's consistent with reserve-order refills and other priority rules that pure price-time ordering doesn't model.
-- **Real-day latency is higher than the synthetic one.** Mean 338 ns vs 204 ns, because a real day has more symbols and a bigger working set, and so more cache misses.
+- **Real-day latency is higher than the synthetic one.** Mean 286 ns vs 204 ns, because a real day has more symbols and a bigger working set, and so more cache misses.
 - **gunzip isn't the bottleneck.** The untimed AAPL pass read the same file at 18.8M msg/s.
 
 ### ITCH replay (synthetic day: 20M messages, 200 symbols)
