@@ -4,7 +4,7 @@ A price-time priority limit order book and matching engine in C++20, with a Nasd
 
 - **Orders:** limit (GTC), IOC, market, cancel, partial cancel, and cancel/replace.
 - **Correctness:** every operation is checked against a brute-force model. The book can never cross, and shares are never created or lost. Three deliberately broken builds of the engine prove that these tests can catch real bugs.
-- **Real data:** replays Nasdaq's ITCH feed and checks that the engine's FIFO choice matches the order Nasdaq actually executed.
+- **Real data:** replays a full Nasdaq trading day (368M ITCH messages). On 99.91% of 8.1M executions, the engine picked the same order Nasdaq actually executed.
 - **Latency:** p50, p99 and p99.9 for each operation type. The histogram uses constant memory, so a full trading day fits.
 
 No dependencies beyond the standard library and CMake.
@@ -74,6 +74,30 @@ The order stream is recorded against a live book, so every cancel names an order
 | cancel | 2,547,805 | 333 ns | 625 ns | 875 ns | 311 ns |
 | reduce | 317,713 | 209 ns | 459 ns | 625 ns | 209 ns |
 
+### ITCH replay: real Nasdaq day (2019-01-30, every symbol)
+
+The input is `01302019.NASDAQ_ITCH50.gz`, streamed through `gunzip -c`.
+
+| | full day | AAPL only |
+|---|---:|---:|
+| ITCH messages | 368,366,634 | (same file, filtered) |
+| Book ops applied | 363,118,215 | 1,656,597 |
+| Wall time, including gunzip and parsing | 149 s (2.5M msg/s, timed run) | 19.6 s (18.8M msg/s, untimed) |
+| Book op latency | p50 250 ns · p99 1,459 ns · p99.9 3,000 ns · mean 338 ns | not timed |
+| Malformed / rejected | 0 / 0 | 0 / 0 |
+| FIFO agreement on `E` executions | **99.913%** (8,089,927 / 8,096,983) | 98.960% (88,174 / 89,101) |
+| Adds that traded in our engine | 97 | 0 |
+| Unknown refs | 137 | 0 |
+| Invariants at end of day | OK | OK (book empty after the close) |
+
+How to read this:
+
+- **The decoder holds up.** It handled all 368M messages with nothing malformed and nothing rejected.
+- **The book mirrors Nasdaq's.** Only 97 adds out of 164.7M crossed our book, and only 137 messages referenced an order we no longer had. My unverified guess: these come from periods when Nasdaq accepts orders without matching them, such as halts and IPO quote-only windows, where the real book can cross until a cross auction clears it. Our engine matches them right away instead. That eats orders Nasdaq still considers live, which then show up later as unknown refs.
+- **The FIFO gap is real exchange behaviour.** About 0.09% of executions hit an order other than the oldest order at the best price. That's consistent with reserve-order refills and other priority rules that pure price-time ordering doesn't model.
+- **Real-day latency is higher than the synthetic one.** Mean 338 ns vs 204 ns, because a real day has more symbols and a bigger working set, and so more cache misses.
+- **gunzip isn't the bottleneck.** The untimed AAPL pass read the same file at 18.8M msg/s.
+
 ### ITCH replay (synthetic day: 20M messages, 200 symbols)
 
 | | |
@@ -107,7 +131,7 @@ The replayer feeds `A`/`F` adds, `E`/`C` executions, `X` partial cancels, `D` de
 - **FIFO agrees:** for each `E` execution, whether Nasdaq executed the same order our price-time priority would pick next.
 - **unknown refs:** how many times ITCH referenced an order our book doesn't have.
 
-Real data has hidden, reserve and cross executions that this model doesn't represent, so expect FIFO agreement below 100% there. The gap measures how far real Nasdaq differs from pure price-time priority.
+Real data has hidden, reserve and cross executions that this model doesn't represent, so FIFO agreement there is below 100%: 99.913% on 2019-01-30 (see Performance). The gap measures how far real Nasdaq differs from pure price-time priority.
 
 `gen_itch` writes a synthetic file in the same format, so all of the above runs without the download:
 
